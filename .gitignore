@@ -1,0 +1,9 @@
+# Local configuration containing the real API key — never commit this.
+config.js
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.log
+.idea/
+.vscode/
