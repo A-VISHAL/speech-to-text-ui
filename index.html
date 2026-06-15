@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VoiceScribe — Speech to Text</title>
+  <meta name="description" content="A modern Speech-to-Text web app powered by Whisper Large v3." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- Animated background blobs for the glassmorphism backdrop -->
+  <div class="bg-blobs" aria-hidden="true">
+    <span class="blob blob-1"></span>
+    <span class="blob blob-2"></span>
+    <span class="blob blob-3"></span>
+  </div>
+
+  <header class="app-header glass">
+    <div class="brand">
+      <span class="brand-logo" aria-hidden="true">🎙️</span>
+      <h1 class="brand-title">VoiceScribe</h1>
+    </div>
+    <button id="themeToggle" class="icon-btn" type="button" title="Toggle light / dark mode" aria-label="Toggle light or dark mode">
+      <span class="theme-icon theme-icon--dark" aria-hidden="true">🌙</span>
+      <span class="theme-icon theme-icon--light" aria-hidden="true">☀️</span>
+    </button>
+  </header>
+
+  <main class="app-main">
+    <section class="recorder glass" aria-label="Audio recorder">
+      <p id="statusText" class="status-text">Tap the mic and start speaking</p>
+
+      <!-- Microphone button (center of the UI) -->
+      <button id="recordBtn" class="mic-btn" type="button" aria-pressed="false" aria-label="Start recording">
+        <span class="mic-pulse" aria-hidden="true"></span>
+        <span class="mic-pulse mic-pulse--delay" aria-hidden="true"></span>
+        <svg class="mic-icon" viewBox="0 0 24 24" width="40" height="40" aria-hidden="true">
+          <path fill="currentColor" d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Z" />
+          <path fill="currentColor" d="M19 11a1 1 0 1 0-2 0 5 5 0 0 1-10 0 1 1 0 1 0-2 0 7 7 0 0 0 6 6.92V21a1 1 0 1 0 2 0v-3.08A7 7 0 0 0 19 11Z" />
+        </svg>
+      </button>
+
+      <!-- Live timer + animated waveform shown while recording -->
+      <div id="recordingMeta" class="recording-meta" hidden>
+        <span id="timer" class="timer">00:00</span>
+        <div class="waveform" aria-hidden="true">
+          <span></span><span></span><span></span><span></span><span></span>
+          <span></span><span></span><span></span><span></span><span></span>
+        </div>
+      </div>
+
+      <!-- Loading spinner shown while the API transcribes -->
+      <div id="loader" class="loader" hidden>
+        <span class="spinner" aria-hidden="true"></span>
+        <span>Transcribing…</span>
+      </div>
+
+      <!-- Error / permission messages -->
+      <div id="errorBox" class="error-box" role="alert" hidden></div>
+    </section>
+
+    <section class="transcript-panel glass" aria-label="Transcript">
+      <div class="transcript-head">
+        <h2 class="panel-title">Transcript</h2>
+        <span id="confidenceBadge" class="confidence-badge" hidden></span>
+      </div>
+
+      <textarea
+        id="transcript"
+        class="transcript-area"
+        placeholder="Your transcribed speech will appear here…"
+        spellcheck="true"
+      ></textarea>
+
+      <div class="toolbar">
+        <button id="copyBtn" class="btn" type="button">📋 Copy</button>
+        <button id="clearBtn" class="btn btn-ghost" type="button">🗑️ Clear</button>
+        <button id="downloadBtn" class="btn btn-primary" type="button">⬇️ Download</button>
+      </div>
+    </section>
+  </main>
+
+  <footer class="app-footer">
+    <small>Powered by Whisper Large v3 · <span id="apiHint"></span></small>
+  </footer>
+
+  <!-- Toast notifications -->
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+  <!--
+    config.js holds the API URL + key (kept out of git via .gitignore).
+    A template lives in config.example.js. See README for setup.
+    Loaded BEFORE script.js so window.APP_CONFIG is available.
+  -->
+  <script src="config.js"></script>
+  <script src="script.js"></script>
+</body>
+</html>
