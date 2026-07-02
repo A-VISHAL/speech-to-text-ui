@@ -7,46 +7,60 @@
    control.
 
    ┌─────────────────────────────────────────────────────────────────────┐
-   │  HOW TO POINT THIS AT A REAL WHISPER ENDPOINT                         │
+   │  CONFIGURATION GUIDE                                                │
    ├─────────────────────────────────────────────────────────────────────┤
-   │  This template is pre-configured for Oxlo.ai's OpenAI-compatible      │
-   │  Whisper Large v3 endpoint. To use a DIFFERENT provider:              │
-   │                                                                       │
-   │  1. Set API_URL to the provider's transcription endpoint, e.g.        │
-   │       - Oxlo.ai : https://api.oxlo.ai/v1/audio/transcriptions         │
-   │       - OpenAI  : https://api.openai.com/v1/audio/transcriptions      │
-   │       - Self-host (your spec): https://your-server.com/transcribe     │
-   │  2. Set API_KEY to your secret key (leave "" if your endpoint needs   │
-   │     no auth, e.g. a local server).                                    │
-   │  3. Set MODEL to the model id the provider expects                    │
-   │     (e.g. "whisper-large-v3"). Set to "" to omit the field.           │
-   │  4. FILE_FIELD is the multipart form field name for the audio file.   │
-   │     OpenAI/Oxlo use "file". The simple "/transcribe" spec uses        │
-   │     "audio" — change it to match YOUR server.                         │
-   │  5. RESPONSE_FORMAT: "verbose_json" returns per-segment data so the   │
-   │     app can show a confidence score. Use "json" for a plain           │
-   │     { "text": "..." } response.                                       │
+   │                                                                     │
+   │  SPEECH-TO-TEXT (voice input):                                      │
+   │  - API_URL: Whisper endpoint for transcription                      │
+   │  - API_KEY: Secret key (Bearer token)                               │
+   │  - MODEL: Model id (e.g. "whisper-large-v3")                        │
+   │  - FILE_FIELD: Multipart field name ("file" for OpenAI/Oxlo)        │
+   │  - RESPONSE_FORMAT: "verbose_json" or "json"                        │
+   │  - LANGUAGE: ISO-639-1 hint or "" for auto-detect                   │
+   │                                                                     │
+   │  CHAT / VISION (agent + image understanding):                       │
+   │  - CHAT_API_URL: Chat completions endpoint (vision-capable model)   │
+   │  - UPLOAD_URL: File upload endpoint for images                      │
+   │  - MAX_IMAGES: Max images per message (default 10)                  │
+   │  - MAX_IMAGE_SIZE_MB: Max file size per image (default 20)          │
+   │  - ACCEPTED_TYPES: MIME types to accept                             │
+   │                                                                     │
+   │  The chat API should accept OpenAI-compatible messages format:      │
+   │  { role: "user", content: [                                         │
+   │    { type: "text", text: "..." },                                   │
+   │    { type: "image_url", image_url: { url: "..." } }                 │
+   │  ]}                                                                 │
+   │                                                                     │
    └─────────────────────────────────────────────────────────────────────┘
    ========================================================================= */
 
 window.APP_CONFIG = {
-  // Full URL of the transcription endpoint.
+  // ─── Speech-to-text (Whisper) ───────────────────────────────────────────
   API_URL: "https://api.oxlo.ai/v1/audio/transcriptions",
-
-  // Secret API key. Sent as "Authorization: Bearer <API_KEY>".
-  // NEVER commit your real key — keep it only in config.js.
   API_KEY: "YOUR_API_KEY_HERE",
-
-  // Model id sent as a form field. Set to "" to omit it entirely.
   MODEL: "whisper-large-v3",
-
-  // Multipart form field name for the audio file ("file" for OpenAI/Oxlo,
-  // "audio" for the bare POST /transcribe spec).
   FILE_FIELD: "file",
-
-  // "verbose_json" enables a confidence score; "json" returns just { text }.
   RESPONSE_FORMAT: "verbose_json",
-
-  // Optional ISO-639-1 hint (e.g. "en"). Leave "" to auto-detect.
   LANGUAGE: "",
+
+  // ─── Chat / Vision Agent ────────────────────────────────────────────────
+  // Endpoint for chat completions (must support vision / image_url content).
+  CHAT_API_URL: "https://api.oxlo.ai/v1/chat/completions",
+
+  // Endpoint for uploading images. The response should include a `url` field.
+  // If upload is not available, images are sent as data URLs (base64).
+  UPLOAD_URL: "https://api.oxlo.ai/v1/files/upload",
+
+  // ─── Image Constraints ──────────────────────────────────────────────────
+  MAX_IMAGES: 10,             // Maximum attachments per message
+  MAX_IMAGE_SIZE_MB: 20,      // Maximum file size per image in MB
+
+  // Accepted MIME types for image attachments.
+  ACCEPTED_TYPES: [
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/gif",
+    "image/svg+xml",
+  ],
 };

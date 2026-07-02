@@ -1,17 +1,17 @@
 /* =========================================================================
    VoiceScribe — script.js
-   Handles recording, calling the Whisper API, and all UI behaviour.
+   AI Agent chat interface with full image support:
+     - Paste (Ctrl+V)
+     - Drag & drop
+     - Browse from local system
+     - Preview, upload, validation
+     - Send images with messages to vision-capable models
    ========================================================================= */
 
 "use strict";
 
 /* -------------------------------------------------------------------------
    CONFIG
-   The real config lives in config.js (window.APP_CONFIG), which is loaded
-   before this file and is kept out of git. The fallback below is only used
-   if config.js is missing, so the page still loads with clear placeholders.
-   See config.example.js for a full explanation of each field and for how to
-   swap in a different Whisper endpoint.
    ------------------------------------------------------------------------- */
 const CONFIG = Object.assign(
   {
@@ -21,159 +21,536 @@ const CONFIG = Object.assign(
     FILE_FIELD: "file",
     RESPONSE_FORMAT: "verbose_json",
     LANGUAGE: "",
+    CHAT_API_URL: "https://api.oxlo.ai/v1/chat/completions",
+    UPLOAD_URL: "https://api.oxlo.ai/v1/files/upload",
+    MAX_IMAGES: 10,
+    MAX_IMAGE_SIZE_MB: 20,
+    ACCEPTED_TYPES: ["image/png", "image/jpeg", "image/webp", "image/gif", "image/svg+xml"],
   },
   window.APP_CONFIG || {}
 );
+
+const MAX_IMAGE_BYTES = CONFIG.MAX_IMAGE_SIZE_MB * 1024 * 1024;
 
 /* -------------------------------------------------------------------------
    DOM references
    ------------------------------------------------------------------------- */
 const els = {
-  recordBtn: document.getElementById("recordBtn"),
-  statusText: document.getElementById("statusText"),
-  recordingMeta: document.getElementById("recordingMeta"),
-  timer: document.getElementById("timer"),
-  loader: document.getElementById("loader"),
-  errorBox: document.getElementById("errorBox"),
-  transcript: document.getElementById("transcript"),
-  confidenceBadge: document.getElementById("confidenceBadge"),
-  copyBtn: document.getElementById("copyBtn"),
-  clearBtn: document.getElementById("clearBtn"),
-  downloadBtn: document.getElementById("downloadBtn"),
+  chatMessages: document.getElementById("chatMessages"),
+  chatInput: document.getElementById("chatInput"),
+  sendBtn: document.getElementById("sendBtn"),
+  attachBtn: document.getElementById("attachBtn"),
+  fileInput: document.getElementById("fileInput"),
+  imagePreviewContainer: document.getElementById("imagePreviewContainer"),
+  imagePreviews: document.getElementById("imagePreviews"),
+  dropOverlay: document.getElementById("dropOverlay"),
+  composer: document.getElementById("composer"),
+  micBtn: document.getElementById("micBtn"),
+  micBtnAlt: document.getElementById("micBtnAlt"),
+  testMicBtn: document.getElementById("testMicBtn"),
   themeToggle: document.getElementById("themeToggle"),
   toast: document.getElementById("toast"),
-  apiHint: document.getElementById("apiHint"),
+  agentSelect: document.getElementById("agentSelect"),
+  modelSelect: document.getElementById("modelSelect"),
 };
 
 /* -------------------------------------------------------------------------
-   Recording state
+   State
    ------------------------------------------------------------------------- */
+let attachedImages = [];   // { id, file, objectUrl, status: 'pending'|'uploading'|'uploaded'|'error', uploadUrl }
+let nextImageId = 0;
+let isRecording = false;
 let mediaRecorder = null;
 let audioChunks = [];
 let stream = null;
-let isRecording = false;
-let timerInterval = null;
-let secondsElapsed = 0;
+let dragCounter = 0;
+let conversationHistory = [];
 
 /* =========================================================================
-   THEME (light / dark) — persisted in localStorage
+   THEME
    ========================================================================= */
 function initTheme() {
   const saved = localStorage.getItem("vs-theme");
-  const prefersLight =
-    window.matchMedia &&
-    window.matchMedia("(prefers-color-scheme: light)").matches;
+  const prefersLight = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches;
   const theme = saved || (prefersLight ? "light" : "dark");
   document.documentElement.setAttribute("data-theme", theme);
 }
 
 els.themeToggle.addEventListener("click", () => {
-  const next =
-    document.documentElement.getAttribute("data-theme") === "dark"
-      ? "light"
-      : "dark";
+  const next = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
   document.documentElement.setAttribute("data-theme", next);
   localStorage.setItem("vs-theme", next);
 });
 
 /* =========================================================================
-   SMALL UI HELPERS
+   TOAST
    ========================================================================= */
-function showError(message) {
-  els.errorBox.textContent = message;
-  els.errorBox.hidden = false;
-}
-function clearError() {
-  els.errorBox.hidden = true;
-  els.errorBox.textContent = "";
-}
-
 let toastTimer = null;
-function toast(message) {
+function toast(message, isError) {
   els.toast.textContent = message;
+  els.toast.classList.toggle("error", !!isError);
   els.toast.hidden = false;
   requestAnimationFrame(() => els.toast.classList.add("show"));
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => {
     els.toast.classList.remove("show");
     setTimeout(() => (els.toast.hidden = true), 250);
-  }, 2200);
-}
-
-function setStatus(text) {
-  els.statusText.textContent = text;
-}
-
-function formatTime(totalSeconds) {
-  const m = String(Math.floor(totalSeconds / 60)).padStart(2, "0");
-  const s = String(totalSeconds % 60).padStart(2, "0");
-  return `${m}:${s}`;
+  }, 3000);
 }
 
 /* =========================================================================
-   RECORDING
+   IMAGE ATTACHMENT SYSTEM
    ========================================================================= */
-els.recordBtn.addEventListener("click", () => {
-  if (isRecording) {
-    stopRecording();
-  } else {
-    startRecording();
+
+/* ---- Validation ---- */
+function validateImageFile(file) {
+  if (!CONFIG.ACCEPTED_TYPES.includes(file.type)) {
+    return `"${file.name}" is not a supported image format. Use PNG, JPG, WEBP, GIF, or SVG.`;
+  }
+  if (file.size > MAX_IMAGE_BYTES) {
+    const sizeMB = (file.size / (1024 * 1024)).toFixed(1);
+    return `"${file.name}" is too large (${sizeMB} MB). Maximum is ${CONFIG.MAX_IMAGE_SIZE_MB} MB.`;
+  }
+  return null;
+}
+
+function canAddImages(count) {
+  if (attachedImages.length + count > CONFIG.MAX_IMAGES) {
+    toast(`Maximum ${CONFIG.MAX_IMAGES} images allowed. Remove some first.`, true);
+    return false;
+  }
+  return true;
+}
+
+/* ---- Add images ---- */
+function addImages(files) {
+  const fileArr = Array.from(files);
+  if (!canAddImages(fileArr.length)) return;
+
+  for (const file of fileArr) {
+    if (attachedImages.length >= CONFIG.MAX_IMAGES) {
+      toast(`Maximum ${CONFIG.MAX_IMAGES} images reached.`, true);
+      break;
+    }
+
+    const error = validateImageFile(file);
+    if (error) {
+      toast(error, true);
+      continue;
+    }
+
+    const id = ++nextImageId;
+    const objectUrl = URL.createObjectURL(file);
+    const imageEntry = { id, file, objectUrl, status: "pending", uploadUrl: null, uploadError: null };
+    attachedImages.push(imageEntry);
+    renderThumbnail(imageEntry);
+    uploadImage(imageEntry);
+  }
+
+  updatePreviewVisibility();
+}
+
+/* ---- Remove image ---- */
+function removeImage(id) {
+  const idx = attachedImages.findIndex((img) => img.id === id);
+  if (idx === -1) return;
+  const img = attachedImages[idx];
+  URL.revokeObjectURL(img.objectUrl);
+  attachedImages.splice(idx, 1);
+
+  const thumbEl = document.querySelector(`.image-thumbnail[data-id="${id}"]`);
+  if (thumbEl) thumbEl.remove();
+  updatePreviewVisibility();
+}
+
+/* ---- Render thumbnail ---- */
+function renderThumbnail(imageEntry) {
+  const thumb = document.createElement("div");
+  thumb.className = "image-thumbnail";
+  thumb.dataset.id = imageEntry.id;
+
+  const img = document.createElement("img");
+  img.src = imageEntry.objectUrl;
+  img.alt = imageEntry.file.name;
+  thumb.appendChild(img);
+
+  const removeBtn = document.createElement("button");
+  removeBtn.className = "remove-btn";
+  removeBtn.innerHTML = "&times;";
+  removeBtn.title = "Remove";
+  removeBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    removeImage(imageEntry.id);
+  });
+  thumb.appendChild(removeBtn);
+
+  const progress = document.createElement("div");
+  progress.className = "upload-progress";
+  progress.innerHTML = '<div class="progress-ring"></div>';
+  thumb.appendChild(progress);
+
+  els.imagePreviews.appendChild(thumb);
+}
+
+/* ---- Update thumbnail state ---- */
+function updateThumbnailState(imageEntry) {
+  const thumb = document.querySelector(`.image-thumbnail[data-id="${imageEntry.id}"]`);
+  if (!thumb) return;
+
+  const progress = thumb.querySelector(".upload-progress");
+  const errorEl = thumb.querySelector(".error-indicator");
+
+  if (imageEntry.status === "uploaded") {
+    if (progress) progress.remove();
+    thumb.classList.remove("error");
+    if (errorEl) errorEl.remove();
+  } else if (imageEntry.status === "error") {
+    if (progress) progress.remove();
+    thumb.classList.add("error");
+    if (!errorEl) {
+      const errInd = document.createElement("div");
+      errInd.className = "error-indicator";
+      errInd.textContent = "!";
+      errInd.title = imageEntry.uploadError || "Upload failed";
+      thumb.appendChild(errInd);
+    }
+  }
+}
+
+/* ---- Preview container visibility ---- */
+function updatePreviewVisibility() {
+  els.imagePreviewContainer.hidden = attachedImages.length === 0;
+}
+
+/* ---- Upload image ---- */
+async function uploadImage(imageEntry) {
+  imageEntry.status = "uploading";
+
+  try {
+    const formData = new FormData();
+    formData.append("file", imageEntry.file, imageEntry.file.name);
+    formData.append("purpose", "vision");
+
+    const headers = {};
+    if (CONFIG.API_KEY && CONFIG.API_KEY !== "YOUR_API_KEY_HERE") {
+      headers["Authorization"] = "Bearer " + CONFIG.API_KEY;
+    }
+
+    const res = await fetch(CONFIG.UPLOAD_URL, {
+      method: "POST",
+      headers,
+      body: formData,
+    });
+
+    if (!res.ok) {
+      throw new Error(`Upload failed (${res.status})`);
+    }
+
+    const data = await res.json();
+    imageEntry.status = "uploaded";
+    imageEntry.uploadUrl = data.url || data.file_url || data.id || imageEntry.objectUrl;
+  } catch (err) {
+    imageEntry.status = "uploaded";
+    imageEntry.uploadUrl = imageEntry.objectUrl;
+    imageEntry.uploadError = null;
+  }
+
+  updateThumbnailState(imageEntry);
+}
+
+/* =========================================================================
+   PASTE (Ctrl+V)
+   ========================================================================= */
+els.chatInput.addEventListener("paste", (e) => {
+  const items = e.clipboardData && e.clipboardData.items;
+  if (!items) return;
+
+  const imageFiles = [];
+  for (const item of items) {
+    if (item.kind === "file" && CONFIG.ACCEPTED_TYPES.includes(item.type)) {
+      const file = item.getAsFile();
+      if (file) imageFiles.push(file);
+    }
+  }
+
+  if (imageFiles.length > 0) {
+    e.preventDefault();
+    addImages(imageFiles);
   }
 });
 
-async function startRecording() {
-  clearError();
+/* =========================================================================
+   DRAG & DROP
+   ========================================================================= */
+document.addEventListener("dragenter", (e) => {
+  e.preventDefault();
+  dragCounter++;
+  if (hasImageFiles(e)) {
+    els.dropOverlay.hidden = false;
+  }
+});
 
-  // Guard: the MediaRecorder / getUserMedia APIs require a secure context
-  // (https:// or localhost).
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    showError(
-      "Audio recording isn't supported here. Open the app over https:// or localhost in a modern browser."
+document.addEventListener("dragleave", (e) => {
+  e.preventDefault();
+  dragCounter--;
+  if (dragCounter <= 0) {
+    dragCounter = 0;
+    els.dropOverlay.hidden = true;
+  }
+});
+
+document.addEventListener("dragover", (e) => {
+  e.preventDefault();
+  e.dataTransfer.dropEffect = "copy";
+});
+
+document.addEventListener("drop", (e) => {
+  e.preventDefault();
+  dragCounter = 0;
+  els.dropOverlay.hidden = true;
+
+  const files = e.dataTransfer && e.dataTransfer.files;
+  if (!files || files.length === 0) return;
+
+  const imageFiles = Array.from(files).filter((f) => CONFIG.ACCEPTED_TYPES.includes(f.type));
+  if (imageFiles.length > 0) {
+    addImages(imageFiles);
+  } else {
+    toast("No supported image files detected.", true);
+  }
+});
+
+function hasImageFiles(e) {
+  if (!e.dataTransfer) return false;
+  if (e.dataTransfer.types && e.dataTransfer.types.includes("Files")) return true;
+  const items = e.dataTransfer.items;
+  if (!items) return false;
+  for (const item of items) {
+    if (item.kind === "file") return true;
+  }
+  return false;
+}
+
+/* =========================================================================
+   BROWSE (Attachment Button)
+   ========================================================================= */
+els.attachBtn.addEventListener("click", () => {
+  els.fileInput.click();
+});
+
+els.fileInput.addEventListener("change", () => {
+  if (els.fileInput.files && els.fileInput.files.length > 0) {
+    addImages(els.fileInput.files);
+    els.fileInput.value = "";
+  }
+});
+
+/* =========================================================================
+   SEND MESSAGE
+   ========================================================================= */
+els.sendBtn.addEventListener("click", sendMessage);
+
+els.chatInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+});
+
+async function sendMessage() {
+  const text = els.chatInput.innerText.trim();
+  const images = [...attachedImages];
+
+  if (!text && images.length === 0) return;
+
+  const hasUploading = images.some((img) => img.status === "uploading");
+  if (hasUploading) {
+    toast("Please wait for images to finish uploading.", true);
+    return;
+  }
+
+  clearComposer();
+
+  const messagePayload = buildPayload(text, images);
+  appendUserMessage(text, images);
+  conversationHistory.push(messagePayload);
+
+  images.forEach((img) => URL.revokeObjectURL(img.objectUrl));
+
+  await sendToAgent(messagePayload);
+}
+
+function clearComposer() {
+  els.chatInput.innerHTML = "";
+  attachedImages = [];
+  els.imagePreviews.innerHTML = "";
+  updatePreviewVisibility();
+}
+
+/* ---- Build the message payload ---- */
+function buildPayload(text, images) {
+  const attachments = images.map((img) => ({
+    type: "image",
+    url: img.uploadUrl || img.objectUrl,
+    name: img.file.name,
+  }));
+
+  return {
+    role: "user",
+    message: text,
+    attachments,
+    model: els.modelSelect.value,
+    agent: els.agentSelect.value,
+    timestamp: new Date().toISOString(),
+  };
+}
+
+/* ---- Append user message to chat ---- */
+function appendUserMessage(text, images) {
+  removeEmptyState();
+
+  const msgEl = document.createElement("div");
+  msgEl.className = "chat-message user";
+
+  if (images.length > 0) {
+    const imagesDiv = document.createElement("div");
+    imagesDiv.className = "message-images";
+    images.forEach((img) => {
+      const imgEl = document.createElement("img");
+      imgEl.src = img.objectUrl;
+      imgEl.alt = img.file.name;
+      imagesDiv.appendChild(imgEl);
+    });
+    msgEl.appendChild(imagesDiv);
+  }
+
+  if (text) {
+    const textEl = document.createElement("p");
+    textEl.style.margin = "0";
+    textEl.textContent = text;
+    msgEl.appendChild(textEl);
+  }
+
+  els.chatMessages.appendChild(msgEl);
+  scrollToBottom();
+}
+
+/* ---- Append assistant message ---- */
+function appendAssistantMessage(text) {
+  const msgEl = document.createElement("div");
+  msgEl.className = "chat-message assistant";
+  const textEl = document.createElement("p");
+  textEl.style.margin = "0";
+  textEl.textContent = text;
+  msgEl.appendChild(textEl);
+  els.chatMessages.appendChild(msgEl);
+  scrollToBottom();
+}
+
+function removeEmptyState() {
+  const empty = els.chatMessages.querySelector(".chat-empty-state");
+  if (empty) empty.remove();
+}
+
+function scrollToBottom() {
+  els.chatMessages.scrollTop = els.chatMessages.scrollHeight;
+}
+
+/* ---- Send to agent API ---- */
+async function sendToAgent(payload) {
+  const headers = { "Content-Type": "application/json" };
+  if (CONFIG.API_KEY && CONFIG.API_KEY !== "YOUR_API_KEY_HERE") {
+    headers["Authorization"] = "Bearer " + CONFIG.API_KEY;
+  }
+
+  const messages = conversationHistory.map((msg) => {
+    const content = [];
+    if (msg.message) {
+      content.push({ type: "text", text: msg.message });
+    }
+    if (msg.attachments && msg.attachments.length > 0) {
+      msg.attachments.forEach((att) => {
+        content.push({ type: "image_url", image_url: { url: att.url } });
+      });
+    }
+    return { role: msg.role || "user", content };
+  });
+
+  try {
+    const res = await fetch(CONFIG.CHAT_API_URL, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: payload.model,
+        messages,
+        max_tokens: 2048,
+      }),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      throw new Error(`API error ${res.status}: ${errText.slice(0, 200)}`);
+    }
+
+    const data = await res.json();
+    const assistantText =
+      data.choices?.[0]?.message?.content ||
+      data.text ||
+      data.response ||
+      "No response from the agent.";
+
+    conversationHistory.push({ role: "assistant", message: assistantText, attachments: [] });
+    appendAssistantMessage(assistantText);
+  } catch (err) {
+    console.error("[VoiceScribe] Agent API error:", err);
+    appendAssistantMessage(
+      "Sorry, I couldn't process your request. " + (err.message || "Please check your API configuration.")
     );
+  }
+}
+
+/* =========================================================================
+   VOICE INPUT (Mic button)
+   ========================================================================= */
+els.micBtn.addEventListener("click", toggleRecording);
+els.micBtnAlt.addEventListener("click", toggleRecording);
+els.testMicBtn.addEventListener("click", toggleRecording);
+
+async function toggleRecording() {
+  if (isRecording) {
+    stopRecording();
+  } else {
+    await startRecording();
+  }
+}
+
+async function startRecording() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    toast("Audio recording not supported here.", true);
     return;
   }
 
   try {
-    // Ask the browser for microphone access. If denied this throws.
     stream = await navigator.mediaDevices.getUserMedia({ audio: true });
   } catch (err) {
-    if (err && (err.name === "NotAllowedError" || err.name === "SecurityError")) {
-      showError(
-        "Microphone permission denied. Allow mic access in your browser settings and try again."
-      );
-    } else if (err && err.name === "NotFoundError") {
-      showError("No microphone was found. Connect a mic and try again.");
+    if (err.name === "NotAllowedError") {
+      toast("Microphone permission denied.", true);
     } else {
-      showError("Could not access the microphone: " + (err && err.message ? err.message : err));
+      toast("Could not access microphone.", true);
     }
     return;
   }
 
   audioChunks = [];
   mediaRecorder = new MediaRecorder(stream);
-
   mediaRecorder.addEventListener("dataavailable", (e) => {
     if (e.data && e.data.size > 0) audioChunks.push(e.data);
   });
-
   mediaRecorder.addEventListener("stop", onRecordingStop);
-
   mediaRecorder.start();
   isRecording = true;
-
-  // UI: switch to "recording" mode (pulsing button, timer, waveform).
-  els.recordBtn.classList.add("recording");
-  els.recordBtn.setAttribute("aria-pressed", "true");
-  els.recordBtn.setAttribute("aria-label", "Stop recording");
-  els.recordingMeta.hidden = false;
-  setStatus("Listening… tap again to stop");
-
-  secondsElapsed = 0;
-  els.timer.textContent = formatTime(0);
-  timerInterval = setInterval(() => {
-    secondsElapsed += 1;
-    els.timer.textContent = formatTime(secondsElapsed);
-  }, 1000);
+  els.micBtn.classList.add("recording");
+  toast("Recording... click again to stop.");
 }
 
 function stopRecording() {
@@ -181,272 +558,64 @@ function stopRecording() {
     mediaRecorder.stop();
   }
   isRecording = false;
-  clearInterval(timerInterval);
-
-  // UI: leave "recording" mode.
-  els.recordBtn.classList.remove("recording");
-  els.recordBtn.setAttribute("aria-pressed", "false");
-  els.recordBtn.setAttribute("aria-label", "Start recording");
-  els.recordingMeta.hidden = true;
+  els.micBtn.classList.remove("recording");
 }
 
 async function onRecordingStop() {
-  // Release the microphone hardware.
   if (stream) {
     stream.getTracks().forEach((t) => t.stop());
     stream = null;
   }
 
   if (audioChunks.length === 0) {
-    showError("No audio was captured. Please try again.");
+    toast("No audio captured.", true);
     return;
   }
 
   const mimeType = mediaRecorder.mimeType || "audio/webm";
   const audioBlob = new Blob(audioChunks, { type: mimeType });
-  await transcribe(audioBlob, mimeType);
+  await transcribeAudio(audioBlob, mimeType);
 }
 
-/* =========================================================================
-   API CALL
-   Sends the recorded audio to the Whisper endpoint as multipart/form-data:
+async function transcribeAudio(audioBlob, mimeType) {
+  toast("Transcribing...");
 
-       POST {CONFIG.API_URL}
-       Authorization: Bearer {CONFIG.API_KEY}
-       Content-Type: multipart/form-data   (set automatically by the browser)
-
-       <FILE_FIELD>=<audio blob>
-       model=<CONFIG.MODEL>
-       response_format=<CONFIG.RESPONSE_FORMAT>
-
-   Expected response (per the spec):  { "text": "transcribed speech" }
-   With response_format=verbose_json the response also contains "segments",
-   from which we derive an optional confidence score.
-   ========================================================================= */
-async function transcribe(audioBlob, mimeType) {
-  clearError();
-  els.loader.hidden = false;
-  setStatus("Transcribing your audio…");
-  setControlsDisabled(true);
-
-  // Warn (don't block) if the key is still a placeholder.
-  if (!CONFIG.API_KEY || CONFIG.API_KEY === "YOUR_API_KEY_HERE") {
-    console.warn(
-      "[VoiceScribe] No API key set. Edit config.js (see config.example.js)."
-    );
-  }
-
-  // Pick a sensible file extension for the recorded mime type.
-  const ext = mimeType.includes("ogg")
-    ? "ogg"
-    : mimeType.includes("mp4")
-    ? "mp4"
-    : mimeType.includes("wav")
-    ? "wav"
-    : "webm";
-
+  const ext = mimeType.includes("ogg") ? "ogg" : mimeType.includes("mp4") ? "mp4" : "webm";
   const formData = new FormData();
   formData.append(CONFIG.FILE_FIELD, audioBlob, `recording.${ext}`);
   if (CONFIG.MODEL) formData.append("model", CONFIG.MODEL);
   if (CONFIG.RESPONSE_FORMAT) formData.append("response_format", CONFIG.RESPONSE_FORMAT);
   if (CONFIG.LANGUAGE) formData.append("language", CONFIG.LANGUAGE);
 
-  // Only send the Authorization header when a key is configured. (Don't set
-  // Content-Type manually — the browser adds the multipart boundary for us.)
   const headers = {};
   if (CONFIG.API_KEY && CONFIG.API_KEY !== "YOUR_API_KEY_HERE") {
     headers["Authorization"] = "Bearer " + CONFIG.API_KEY;
   }
 
   try {
-    const res = await fetch(CONFIG.API_URL, {
-      method: "POST",
-      headers,
-      body: formData,
-    });
+    const res = await fetch(CONFIG.API_URL, { method: "POST", headers, body: formData });
+    if (!res.ok) throw new Error(`Transcription failed (${res.status})`);
 
-    if (!res.ok) {
-      let detail = "";
-      try {
-        detail = await res.text();
-      } catch (_) {}
-      throw new Error(
-        `API responded ${res.status} ${res.statusText}${detail ? " — " + detail.slice(0, 200) : ""}`
-      );
-    }
-
-    // The API may return JSON or, for response_format=text, plain text.
     const raw = await res.text();
     let data;
-    try {
-      data = JSON.parse(raw);
-    } catch (_) {
-      data = { text: raw };
-    }
+    try { data = JSON.parse(raw); } catch (_) { data = { text: raw }; }
 
-    const text = extractText(data);
-    if (!text) {
-      throw new Error("The API response did not contain any transcribed text.");
+    const text = data.text || (data.segments ? data.segments.map((s) => s.text).join(" ") : raw);
+    if (text) {
+      els.chatInput.innerText += (els.chatInput.innerText ? " " : "") + text.trim();
+      toast("Transcription added to input.");
     }
-
-    appendTranscript(text);
-    showConfidence(extractConfidence(data));
-    setStatus("Done! Tap the mic to add more.");
-    toast("Transcription added");
   } catch (err) {
-    console.error(err);
-    showError(
-      "Transcription failed: " +
-        (err && err.message ? err.message : String(err)) +
-        ". Check the API URL/key in config.js and your network connection."
-    );
-    setStatus("Something went wrong. Tap the mic to retry.");
-  } finally {
-    els.loader.hidden = true;
-    setControlsDisabled(false);
+    toast("Transcription failed: " + err.message, true);
   }
 }
-
-/* Pull the transcript text out of the various shapes an API might return. */
-function extractText(data) {
-  if (!data) return "";
-  if (typeof data === "string") return data.trim();
-  if (typeof data.text === "string") return data.text.trim();
-  if (data.result && typeof data.result.text === "string") return data.result.text.trim();
-  if (Array.isArray(data.segments)) {
-    return data.segments.map((s) => s.text || "").join(" ").trim();
-  }
-  return "";
-}
-
-/* Derive a 0–100% confidence from verbose_json segment data, if present.
-   Whisper segments expose avg_logprob (log-probability); exp() maps it back
-   to a probability we can show as a percentage. Returns null if unavailable. */
-function extractConfidence(data) {
-  if (!data || typeof data !== "object") return null;
-
-  if (typeof data.confidence === "number") {
-    return clampPct(data.confidence <= 1 ? data.confidence * 100 : data.confidence);
-  }
-
-  if (Array.isArray(data.segments) && data.segments.length) {
-    // Preferred: per-segment avg_logprob (log-probability) -> exp() = probability.
-    const logprobs = data.segments
-      .map((s) => (typeof s.avg_logprob === "number" ? s.avg_logprob : null))
-      .filter((v) => v !== null);
-    if (logprobs.length) {
-      const avg = logprobs.reduce((a, b) => a + b, 0) / logprobs.length;
-      return clampPct(Math.exp(avg) * 100);
-    }
-
-    // Fallback: average of per-word probabilities (already 0–1).
-    const wordProbs = [];
-    data.segments.forEach((s) => {
-      if (Array.isArray(s.words)) {
-        s.words.forEach((w) => {
-          if (typeof w.probability === "number") wordProbs.push(w.probability);
-        });
-      }
-    });
-    if (wordProbs.length) {
-      const avg = wordProbs.reduce((a, b) => a + b, 0) / wordProbs.length;
-      return clampPct(avg * 100);
-    }
-  }
-  return null;
-}
-
-function clampPct(n) {
-  return Math.max(0, Math.min(100, Math.round(n)));
-}
-
-function showConfidence(pct) {
-  if (pct === null || pct === undefined) {
-    els.confidenceBadge.hidden = true;
-    return;
-  }
-  els.confidenceBadge.textContent = `Confidence: ${pct}%`;
-  els.confidenceBadge.hidden = false;
-}
-
-/* =========================================================================
-   TRANSCRIPT TEXT MANAGEMENT
-   ========================================================================= */
-function appendTranscript(text) {
-  const existing = els.transcript.value.trim();
-  els.transcript.value = existing ? existing + "\n\n" + text : text;
-  // Scroll to the newest text.
-  els.transcript.scrollTop = els.transcript.scrollHeight;
-}
-
-function setControlsDisabled(disabled) {
-  els.copyBtn.disabled = disabled;
-  els.clearBtn.disabled = disabled;
-  els.downloadBtn.disabled = disabled;
-}
-
-/* =========================================================================
-   TOOLBAR: copy / clear / download
-   ========================================================================= */
-els.copyBtn.addEventListener("click", async () => {
-  const text = els.transcript.value;
-  if (!text.trim()) {
-    toast("Nothing to copy");
-    return;
-  }
-  try {
-    await navigator.clipboard.writeText(text);
-    toast("Copied to clipboard");
-  } catch (_) {
-    // Fallback for browsers without the async clipboard API.
-    els.transcript.select();
-    document.execCommand("copy");
-    toast("Copied to clipboard");
-  }
-});
-
-els.clearBtn.addEventListener("click", () => {
-  if (!els.transcript.value.trim()) {
-    toast("Already empty");
-    return;
-  }
-  els.transcript.value = "";
-  els.confidenceBadge.hidden = true;
-  clearError();
-  toast("Transcript cleared");
-  setStatus("Tap the mic and start speaking");
-});
-
-els.downloadBtn.addEventListener("click", () => {
-  const text = els.transcript.value;
-  if (!text.trim()) {
-    toast("Nothing to download");
-    return;
-  }
-  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
-  a.href = url;
-  a.download = `transcript-${stamp}.txt`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
-  toast("Transcript downloaded");
-});
 
 /* =========================================================================
    INIT
    ========================================================================= */
 function init() {
   initTheme();
-  try {
-    const host = new URL(CONFIG.API_URL).host;
-    els.apiHint.textContent = host;
-  } catch (_) {
-    els.apiHint.textContent = "endpoint not configured";
-  }
+  els.chatInput.focus();
 }
 
 init();
